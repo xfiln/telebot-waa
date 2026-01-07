@@ -15,7 +15,7 @@ generate_keypair.js
 activation.token
 issue_token.js
 main__.js
-main_1.json
+main_1.js
 private.pem
 public.pem
 gc.js
