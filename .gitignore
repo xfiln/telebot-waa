@@ -1,0 +1,42 @@
+# Ignore node_modules directory
+node_modules/
+# Ignore log files
+*.log
+# Ignore temporary files
+*.tmp
+# Ignore compiled files
+*.js.map
+# Ignore configuration files
+package-lock.json
+.git/
+database.json
+hah.mp4
+generate_keypair.js
+activation.token
+issue_token.js
+main__.js
+main_1.json
+private.pem
+public.pem
+gc.js
+.git
+response.json
+rpg-warTakjil.js
+sync.js
+/lib/repoWatcher.js
+/lib/sessionManager.js
+
+database.json
+repo_cache.json
+
+# secrets
+.env
+session/
+
+
+# runtime/cache
+/tmp/
+/backups/
+/asups/
+/data/
+/data/backups/

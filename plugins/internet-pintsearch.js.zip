@@ -1,0 +1,566 @@
+/*
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+
+// ------ Helpers yang bikin aman lintas platform (Telegraf/WA) ------
+function getMessageId(msg) {
+  return msg?.message_id
+      ?? msg?.id
+      ?? msg?.key?.id
+      ?? msg?.message?.message_id
+      ?? msg?.message?.id
+      ?? msg?.message?.key?.id
+      ?? null;
+}
+
+function getChatId(obj) {
+  return obj?.chat?.id ?? obj?.chat ?? obj?.message?.chat?.id ?? null;
+}
+
+async function safeDelete(conn, chat, msgOrId) {
+  const chatId = getChatId({ chat });
+  const id = typeof msgOrId === 'string' || typeof msgOrId === 'number' ? msgOrId : getMessageId(msgOrId);
+  if (!chatId || !id) return false;
+  try {
+    await conn.deleteMessage(chatId, id);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function safeEditOrReply(conn, m, loadingMsg, text) {
+  try {
+    const chatId = getChatId(m);
+    const msgId = getMessageId(loadingMsg);
+    if (chatId && msgId && conn.editMessage) {
+      await conn.editMessage(chatId, { message_id: msgId }, { text });
+      return;
+    }
+  } catch {}
+  try { await m.reply(text); } catch {}
+}
+
+// ----------------- Session store per chat -----------------
+let pinterestSessions = {};
+
+// ----------------- Pinterest API Functions -----------------
+async function getPinterestMedia(url) {
+  try {
+    const apiUrl = `https://api.pinterest.com/url_resource/?url=${encodeURIComponent(url)}`;
+    const response = await axios.get(apiUrl);
+    
+    if (response.data && response.data.resource_response) {
+      const data = response.data.resource_response.data;
+      return {
+        title: data.title || 'Pinterest Media',
+        description: data.description || '',
+        image: data.images?.orig?.url || data.image_large_url,
+        video: data.videos?.video_list?.V_720P?.url || data.story_pin_data?.pages?.[0]?.blocks?.[0]?.video?.video_list?.V_720P?.url
+      };
+    }
+    throw new Error('Failed to fetch Pinterest data');
+  } catch (err) {
+    throw new Error('Pinterest API error: ' + err.message);
+  }
+}
+
+async function downloadMedia(url, filename) {
+  const filepath = path.join(__dirname, '../tmp', filename);
+  try {
+    const res = await axios.get(url, { responseType: 'stream' });
+    await new Promise((resolve, reject) => {
+      const writer = fs.createWriteStream(filepath);
+      res.data.pipe(writer);
+      writer.on('finish', resolve);
+      writer.on('error', reject);
+    });
+    return filepath;
+  } catch (err) {
+    throw new Error('Download failed: ' + err.message);
+  }
+}
+
+// ----------------- Handler utama -----------------
+let handler = async (m, { conn, args, usedPrefix, command }) => {
+  if (!args[0]) {
+    return m.reply(`Usage: ${usedPrefix + command} <pinterest_url>`);
+  }
+
+  const url = args[0];
+  if (!url.includes('pinterest.com') && !url.includes('pin.it')) {
+    return m.reply('❌ Please provide a valid Pinterest URL');
+  }
+
+  const loadingMsg = await m.reply('📥 Fetching Pinterest media...');
+
+  try {
+    const media = await getPinterestMedia(url);
+    const sessionId = Date.now().toString();
+    
+    pinterestSessions[sessionId] = {
+      media,
+      originalMessageId: getMessageId(m)
+    };
+
+    const buttons = [];
+    if (media.image) {
+      buttons.push([{ text: '🖼️ Download Image', callback_data: `pinterest_image_${sessionId}` }]);
+    }
+    if (media.video) {
+      buttons.push([{ text: '🎥 Download Video', callback_data: `pinterest_video_${sessionId}` }]);
+    }
+    buttons.push([{ text: 'ℹ️ Info', callback_data: `pinterest_info_${sessionId}` }]);
+
+    const caption = `📌 *Pinterest Media*\n\n📝 ${media.title}\n${media.description ? `\n${media.description.substring(0, 100)}...` : ''}`;
+
+    const quotedParam = pinterestSessions[sessionId].originalMessageId 
+      ? { message_id: pinterestSessions[sessionId].originalMessageId } 
+      : {};
+
+    await conn.sendButt(
+      getChatId(m),
+      caption,
+      buttons,
+      quotedParam
+    );
+
+    await safeDelete(conn, m.chat, loadingMsg);
+
+  } catch (err) {
+    console.error('[PINTEREST ERROR]:', err);
+    await safeEditOrReply(conn, m, loadingMsg, `❌ Error: ${err.message}`);
+  }
+};
+
+// ----------------- Callback Handler -----------------
+handler.callback = async (ctx) => {
+  const data = ctx?.callbackQuery?.data || ctx?.data;
+  const conn = ctx.conn;
+  
+  if (!data || !data.startsWith('pinterest_')) {
+    return false;
+  }
+
+  const parts = data.split('_');
+  if (parts.length < 3) return false;
+  
+  const action = parts[1];
+  const sessionId = parts[2];
+  const session = pinterestSessions[sessionId];
+  
+  if (!session) {
+    await ctx.answerCbQuery?.('❌ Session expired', { show_alert: true });
+    return true;
+  }
+
+  try {
+    const chatId = ctx?.callbackQuery?.message?.chat?.id || ctx?.message?.chat?.id;
+    const quotedParam = session.originalMessageId ? { message_id: session.originalMessageId } : {};
+
+    if (action === 'image' && session.media.image) {
+      await ctx.answerCbQuery?.('📤 Sending image...');
+      
+      const filename = `pinterest_${sessionId}.jpg`;
+      const filepath = await downloadMedia(session.media.image, filename);
+      
+      await conn.sendButt(
+        chatId,
+        `🖼️ *Pinterest Image*\n\n📝 ${session.media.title}`,
+        [],
+        quotedParam,
+        { photo: { source: fs.createReadStream(filepath) } }
+      );
+
+      setTimeout(() => {
+        try {
+          if (fs.existsSync(filepath)) fs.unlinkSync(filepath);
+        } catch {}
+      }, 30000);
+
+    } else if (action === 'video' && session.media.video) {
+      await ctx.answerCbQuery?.('📤 Sending video...');
+      
+      const filename = `pinterest_${sessionId}.mp4`;
+      const filepath = await downloadMedia(session.media.video, filename);
+      
+      await conn.sendButt(
+        chatId,
+        `🎥 *Pinterest Video*\n\n📝 ${session.media.title}`,
+        [],
+        quotedParam,
+        { video: { source: fs.createReadStream(filepath) }, supports_streaming: true }
+      );
+
+      setTimeout(() => {
+        try {
+          if (fs.existsSync(filepath)) fs.unlinkSync(filepath);
+        } catch {}
+      }, 30000);
+
+    } else if (action === 'info') {
+      await ctx.answerCbQuery?.('ℹ️ Getting info...');
+      
+      const buttons = [];
+      if (session.media.image) {
+        buttons.push([{ text: '🖼️ Download Image', callback_data: `pinterest_image_${sessionId}` }]);
+      }
+      if (session.media.video) {
+        buttons.push([{ text: '🎥 Download Video', callback_data: `pinterest_video_${sessionId}` }]);
+      }
+
+      await conn.sendButt(
+        chatId,
+        `📋 *Pinterest Info*\n\n📝 Title: ${session.media.title}\n\n${session.media.description}\n\n${session.media.image ? '✅ Image available\n' : ''}${session.media.video ? '✅ Video available' : ''}`,
+        buttons,
+        quotedParam
+      );
+    }
+    
+    return true;
+    
+  } catch (err) {
+    console.error('[PINTEREST ERROR]:', err);
+    try { await ctx.answerCbQuery?.('❌ Operation failed', { show_alert: true }); } catch {}
+    return true;
+  }
+};
+
+handler.help = ['pinterest <url>'];
+handler.tags = ['downloader'];
+handler.command = /^(pinterest|pin)$/i;
+
+module.exports = handler;
+*/
+
+// const axios = require('axios');
+// const fs = require('fs');
+// const path = require('path');
+// const { searchPinterestAPI, downloadVideo: downloadPinterestVideo } = require('../lib/pinterest');
+
+// const VIDEO_DIR = path.join(__dirname, '../tmp');
+// if (!fs.existsSync(VIDEO_DIR)) fs.mkdirSync(VIDEO_DIR, { recursive: true });
+
+// const delay = ms => new Promise(r => setTimeout(r, ms));
+
+// function getMessageId(msg) {
+//   return msg?.message_id
+//       ?? msg?.id
+//       ?? msg?.key?.id
+//       ?? msg?.message?.message_id
+//       ?? msg?.message?.id
+//       ?? msg?.message?.key?.id
+//       ?? null;
+// }
+
+// function getChatId(obj) {
+//   return obj?.chat?.id ?? obj?.chat ?? obj?.message?.chat?.id ?? null;
+// }
+
+// async function safeDelete(conn, chat, msgOrId) {
+//   const chatId = getChatId({ chat });
+//   const id = typeof msgOrId === 'string' || typeof msgOrId === 'number' ? msgOrId : getMessageId(msgOrId);
+//   if (!chatId || !id) return false;
+//   try {
+//     await conn.deleteMessage(chatId, id);
+//     return true;
+//   } catch {
+//     return false;
+//   }
+// }
+
+// async function safeEditOrReply(conn, m, loadingMsg, text) {
+//   try {
+//     const chatId = getChatId(m);
+//     const msgId = getMessageId(loadingMsg);
+//     await conn.editMessage(chatId, { message_id: msgId }, { text });
+//     return;
+//   } catch {}
+//   try { await m.reply(text); } catch {}
+// }
+
+// let pinterestSessions = {};
+
+// async function getPinterestMedia(url) {
+//   try {
+//     const apiUrl = `https://api.pinterest.com/url_resource/?url=${encodeURIComponent(url)}`;
+//     const response = await axios.get(apiUrl);
+
+//     if (response.data?.resource_response) {
+//       const data = response.data.resource_response.data;
+//       return {
+//         title: data.title || 'Pinterest Media',
+//         description: data.description || '',
+//         image: data.images?.orig?.url || data.image_large_url,
+//         video:
+//           data.videos?.video_list?.V_720P?.url ||
+//           data.story_pin_data?.pages?.[0]?.blocks?.[0]?.video?.video_list?.V_720P?.url
+//       };
+//     }
+//     throw new Error('Failed to fetch Pinterest data');
+//   } catch (err) {
+//     throw new Error('Pinterest API error: ' + err.message);
+//   }
+// }
+
+// async function downloadMedia(url, filename) {
+//   const filepath = path.join(VIDEO_DIR, filename);
+//   try {
+//     const res = await axios.get(url, { responseType: 'stream' });
+//     await new Promise((resolve, reject) => {
+//       const writer = fs.createWriteStream(filepath);
+//       res.data.pipe(writer);
+//       writer.on('finish', resolve);
+//       writer.on('error', reject);
+//     });
+//     return filepath;
+//   } catch (err) {
+//     throw new Error('Download failed: ' + err.message);
+//   }
+// }
+
+// let handler = async (m, { conn, args, usedPrefix, command }) => {
+//   const chatId = getChatId(m);
+
+//   // ======================= PINTEREST URL ==========================
+//   if (args[0] && (args[0].includes('pinterest.com') || args[0].includes('pin.it'))) {
+//     const url = args[0];
+//     const loadingMsg = await m.reply('📥 Fetching Pinterest media...');
+
+//     try {
+//       const media = await getPinterestMedia(url);
+//       const sessionId = Date.now().toString();
+
+//       pinterestSessions[sessionId] = {
+//         media,
+//         originalMessageId: getMessageId(m)
+//       };
+
+//       const buttons = [];
+//       if (media.image) buttons.push([{ text: '🖼️ Download Image', callback_data: `pinterest_image_${sessionId}` }]);
+//       if (media.video) buttons.push([{ text: '🎥 Download Video', callback_data: `pinterest_video_${sessionId}` }]);
+//       buttons.push([{ text: 'ℹ️ Info', callback_data: `pinterest_info_${sessionId}` }]);
+
+//       const caption = `📌 *Pinterest Media*\n\n📝 ${media.title}\n${media.description ? `\n${media.description.substring(0, 100)}...` : ''}`;
+
+//       await conn.sendButt(chatId, caption, buttons, { message_id: getMessageId(m) });
+//       await safeDelete(conn, m.chat, loadingMsg);
+
+//     } catch (err) {
+//       await safeEditOrReply(conn, m, loadingMsg, `❌ Error: ${err.message}`);
+//     }
+//     return;
+//   }
+
+//   // ======================== PINTEREST SEARCH ==========================
+//   if (args[0]) {
+//     const query = args.join(' ');
+//     const loadingMsg = await m.reply(`🔍 Searching Pinterest for "${query}"...`);
+
+//     try {
+//       const results = await searchPinterestAPI(query, 10);
+//       if (results.length === 0) {
+//         await safeEditOrReply(conn, m, loadingMsg, `❌ No results found`);
+//         return;
+//       }
+
+//       const sessionId = Date.now().toString();
+//       pinterestSessions[sessionId] = {
+//         query,
+//         results,
+//         currentIndex: 0,
+//         originalMessageId: getMessageId(m)
+//       };
+
+//       const current = results[0];
+
+//       const previewImage =
+//         current.type === 'image'
+//           ? current.url
+//           : current.thumbnail || null;
+
+//       const buttons = [
+//         [
+//           { text: '⬅️ Prev', callback_data: `pinsearch_prev_${sessionId}` },
+//           { text: `1/${results.length}`, callback_data: `pinsearch_info_${sessionId}` },
+//           { text: 'Next ➡️', callback_data: `pinsearch_next_${sessionId}` }
+//         ],
+//         [{ text: `📥 Download ${current.type === 'video' ? 'Video' : 'Image'}`, callback_data: `pinsearch_download_${sessionId}` }]
+//       ];
+
+//       const caption =
+//         `🔍 *Pinterest Search*\n\n` +
+//         `📝 Query: ${query}\n📊 Found: ${results.length} items\n\n` +
+//         `${current.type === 'video' ? '🎥' : '🖼️'} *${current.title}*`;
+
+//       await conn.sendButt(
+//         chatId,
+//         { text: caption, image: previewImage },
+//         buttons,
+//         { message_id: getMessageId(m) }
+//       );
+
+//       await safeDelete(conn, m.chat, loadingMsg);
+
+//     } catch (err) {
+//       await safeEditOrReply(conn, m, loadingMsg, `❌ Error: ${err.message}`);
+//     }
+//     return;
+//   }
+
+//   return m.reply(`📌 *Pinterest Downloader*\n\nUsage:\n${usedPrefix + command} <url|query>\n`);
+// };
+
+// // ======================= CALLBACK HANDLER ===========================
+
+// handler.callback = async (ctx) => {
+//   const data = ctx?.callbackQuery?.data;
+//   const conn = ctx.conn;
+//   const chatId = ctx?.callbackQuery?.message?.chat?.id;
+//   if (!data) return false;
+
+//   // ---------------------- URL MODE ----------------------
+//   if (data.startsWith('pinterest_')) {
+//     const [, action, id] = data.split('_');
+//     const session = pinterestSessions[id];
+//     if (!session) return ctx.answerCbQuery?.('❌ Session expired');
+
+//     const media = session.media;
+//     const quoted = session.originalMessageId ? { message_id: session.originalMessageId } : {};
+
+//     if (action === 'image') {
+//       await ctx.answerCbQuery?.('📤 Sending image...');
+//       const fp = await downloadMedia(media.image, `pinterest_${id}.jpg`);
+//       await conn.telegram.sendPhoto(chatId, { source: fp }, {
+//         caption: `🖼️ *Pinterest Image*\n\n${media.title}`,
+//         parse_mode: 'Markdown',
+//         reply_to_message_id: quoted.message_id
+//       });
+//       fs.unlink(fp, () => {});
+//       return true;
+//     }
+
+//     if (action === 'video') {
+//       await ctx.answerCbQuery?.('📤 Sending video...');
+//       const fp = await downloadMedia(media.video, `pinterest_${id}.mp4`);
+//       await conn.sendButt(chatId, {
+//         text: `🎥 *Pinterest Video*\n\n${media.title}`,
+//         video: { source: fp }
+//       }, [], quoted);
+//       fs.unlink(fp, () => {});
+//       return true;
+//     }
+
+//     if (action === 'info') {
+//       await ctx.answerCbQuery?.('ℹ️ Info');
+//       const buttons = [];
+//       if (media.image) buttons.push([{ text: '🖼️ Image', callback_data: `pinterest_image_${id}` }]);
+//       if (media.video) buttons.push([{ text: '🎥 Video', callback_data: `pinterest_video_${id}` }]);
+
+//       await conn.sendButt(chatId,
+//         `📋 *Pinterest Info*\n\n📝 ${media.title}\n\n${media.description}`,
+//         buttons,
+//         quoted
+//       );
+//       return true;
+//     }
+
+//     return false;
+//   }
+
+//   // ---------------------- SEARCH MODE ----------------------
+//   if (data.startsWith('pinsearch_')) {
+//     const [, action, id] = data.split('_');
+//     const session = pinterestSessions[id];
+//     if (!session) return ctx.answerCbQuery?.('❌ Session expired');
+
+//     const { results } = session;
+
+//     if (action === 'prev') {
+//       session.currentIndex = (session.currentIndex - 1 + results.length) % results.length;
+//       return ctx.answerCbQuery?.('◀️');
+//     }
+
+//     if (action === 'next') {
+//       session.currentIndex = (session.currentIndex + 1) % results.length;
+//       return ctx.answerCbQuery?.('▶️');
+//     }
+
+//     if (action === 'download') {
+//       await ctx.answerCbQuery?.('📥 Downloading...');
+//       const item = results[session.currentIndex];
+//       const quoted = session.originalMessageId ? { message_id: session.originalMessageId } : {};
+
+//       if (item.type === 'video') {
+//         const fp = await downloadPinterestVideo(item.url, item.filename, VIDEO_DIR);
+//         await conn.sendButt(chatId, {
+//           text: `🎥 *${item.title}*`,
+//           video: { source: fp }
+//         }, [], quoted);
+//         fs.unlink(fp, () => {});
+//         return true;
+//       } else {
+//         const fp = await downloadMedia(item.url, `pin_${id}_${session.currentIndex}.jpg`);
+//         await conn.sendButt(chatId, {
+//           text: `🖼️ *${item.title}*`,
+//           image: { source: fp }
+//         }, [], quoted);
+//         fs.unlink(fp, () => {});
+//         return true;
+//       }
+//     }
+
+//     if (action === 'info') {
+//       return ctx.answerCbQuery?.(`${session.currentIndex + 1}/${results.length}`);
+//     }
+
+//     // UPDATE THUMBNAIL + TEXT
+//     const item = results[session.currentIndex];
+
+//     const previewImage =
+//       item.type === 'image'
+//         ? item.url
+//         : item.thumbnail || null;
+
+//     const buttons = [
+//       [
+//         { text: '⬅️ Prev', callback_data: `pinsearch_prev_${id}` },
+//         { text: `${session.currentIndex + 1}/${results.length}`, callback_data: `pinsearch_info_${id}` },
+//         { text: 'Next ➡️', callback_data: `pinsearch_next_${id}` }
+//       ],
+//       [{ text: `📥 Download ${item.type === 'video' ? 'Video' : 'Image'}`, callback_data: `pinsearch_download_${id}` }]
+//     ];
+
+//     await conn.editMessage(
+//       chatId,
+//       { message_id: ctx.callbackQuery.message.message_id },
+//       {
+//         text:
+//           `🔍 *Pinterest Search*\n\n` +
+//           `${item.type === 'video' ? '🎥' : '🖼️'} *${item.title}*`,
+//         reply_markup: { inline_keyboard: buttons }
+//       }
+//     );
+
+//     // UPDATE thumbnail hanya berupa image terpisah (opsional)
+//     await conn.telegram.sendPhoto(chatId, previewImage);
+
+//     return true;
+//   }
+
+//   return false;
+// };
+
+// // ======================= FIX CALLBACK UNTUK main.js =======================
+
+// handler.callbackQueryPrefix = /^(pinterest_|pinsearch_)/i;
+// handler.priority = 999;
+
+// // ==========================================================================
+
+// handler.help = ['pinterest <url|query>'];
+// handler.tags = ['internet'];
+// handler.command = /^(pinterest|pin|pinsearch)$/i;
+
+// module.exports = handler;
